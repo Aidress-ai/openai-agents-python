@@ -23,7 +23,6 @@ from ._mount_security import (
     _replace_protected_mount_error,
     _validate_manifest_mount_provenance,
     redact_mount_error_data,
-    validate_manifest_mount_credential_boundaries,
 )
 from .capabilities import Capability
 from .entries import BaseEntry, Dir, Mount, resolve_workspace_path
@@ -558,6 +557,7 @@ class SandboxRuntimeSessionManager(Generic[TContext]):
             run_as_user,
         )
         mount_credential_exposure_policy = processed_manifest._mount_credential_exposure_policy
+        process_environment_access = processed_manifest._process_environment_access
         for capability in capabilities:
             safe_error: BaseException | None = None
             try:
@@ -566,6 +566,9 @@ class SandboxRuntimeSessionManager(Generic[TContext]):
                     processed_manifest._merge_mount_credential_exposure_policy(
                         mount_credential_exposure_policy
                     )
+                )
+                process_environment_access = processed_manifest._merge_process_environment_access(
+                    process_environment_access
                 )
             except BaseException as error:
                 if not _manifest_has_configured_mount_authority(processed_manifest):
@@ -578,6 +581,7 @@ class SandboxRuntimeSessionManager(Generic[TContext]):
                 manifest = None
                 processed_manifest = cast(Any, None)
                 mount_credential_exposure_policy = cast(Any, None)
+                process_environment_access = cast(Any, None)
                 run_as_user = None
                 _raise_data_redacted_error(safe_error)
         return processed_manifest
@@ -597,9 +601,8 @@ class SandboxRuntimeSessionManager(Generic[TContext]):
             run_as_user=cls._agent_run_as_user(agent),
         )
         if processed_manifest is None or processed_manifest == current_manifest:
-            validate_manifest_mount_credential_boundaries(
-                current_manifest,
-                provider_backend_id=session.state.type,
+            await session._validate_manifest_before_provider_probe(
+                manifest=current_manifest,
             )
             running = await session.running()
             await session._validate_manifest_application(
@@ -608,13 +611,23 @@ class SandboxRuntimeSessionManager(Generic[TContext]):
             )
             return _LiveSessionManifestUpdate(processed_manifest=None, entries_to_apply=[])
 
+        if (
+            processed_manifest._declared_process_environment_bindings()
+            != current_manifest._declared_process_environment_bindings()
+            or processed_manifest._process_environment_access
+            != current_manifest._process_environment_access
+        ):
+            raise ValueError(
+                "Injected sandbox sessions cannot change ProcessEnvValue bindings or grants; "
+                "use a client-owned fresh session or resume path instead"
+            )
+
         cls._validate_live_session_host_path_grants(
             current_manifest=current_manifest,
             processed_manifest=processed_manifest,
         )
-        validate_manifest_mount_credential_boundaries(
-            processed_manifest,
-            provider_backend_id=session.state.type,
+        await session._validate_manifest_before_provider_probe(
+            manifest=processed_manifest,
         )
         running = await session.running()
         await session._validate_manifest_application(
@@ -824,6 +837,9 @@ class SandboxRuntimeSessionManager(Generic[TContext]):
         provider_backend_id: str,
     ) -> SandboxSessionState:
         resume_manifest = session_state.manifest
+        if trusted_manifest is not None:
+            resume_manifest = resume_manifest.model_copy(deep=True)
+            resume_manifest._copy_process_environment_access_from(trusted_manifest)
         if session_state.path_grants_require_rebind and trusted_manifest is not None:
             resume_manifest = resume_manifest.model_copy(
                 update={

@@ -142,6 +142,7 @@ class BaseSandboxClient(abc.ABC, Generic[ClientOptionsT]):
             manifest,
             provider_backend_id=self.backend_id,
         )
+        manifest._validate_process_environment_access()
         return manifest
 
     @abc.abstractmethod

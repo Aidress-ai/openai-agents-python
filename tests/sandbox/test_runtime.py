@@ -72,6 +72,7 @@ from agents.sandbox.errors import (
     WorkspaceArchiveWriteError,
 )
 from agents.sandbox.files import EntryKind, FileEntry
+from agents.sandbox.manifest import Environment, ProcessEnvValue
 from agents.sandbox.materialization import MaterializationResult, MaterializedFile
 from agents.sandbox.remote_mount_policy import (
     REMOTE_MOUNT_POLICY,
@@ -507,7 +508,7 @@ async def test_sandbox_session_aclose_closes_dependencies_when_stop_fails() -> N
         await session.aclose()
 
     assert inner.stop_calls == 1
-    assert inner.shutdown_calls == 0
+    assert inner.shutdown_calls == 1
     assert inner.close_dependency_calls == 1
 
 
@@ -1191,6 +1192,25 @@ def test_process_manifest_preserves_mount_acknowledgement_across_replacement() -
         "/workspace/data",
         "mount_scoped",
     )
+
+
+@pytest.mark.asyncio
+async def test_process_manifest_preserves_process_environment_access_across_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "SANDBOX_TEST_PROCESS_ENV_VALUE"
+    monkeypatch.setenv(name, "from-process")
+    manifest = Manifest(
+        environment=Environment(value={name: ProcessEnvValue()})
+    ).with_process_environment_access(name)
+
+    processed = SandboxRuntimeSessionManager._process_manifest(
+        [_ManifestReplacementCapability()],
+        manifest,
+    )
+
+    assert processed is not None
+    assert await processed.resolve_environment() == {name: "from-process"}
 
 
 @pytest.mark.parametrize(
@@ -3867,6 +3887,75 @@ async def test_session_manager_rebinds_persisted_path_grants_from_current_manife
     assert client.resume_state is not None
     assert client.resume_state.manifest.extra_path_grants == trusted_manifest.extra_path_grants
     assert client.resume_state.path_grants_require_rebind == ()
+
+
+@pytest.mark.asyncio
+async def test_session_manager_rebinds_process_environment_access_from_current_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "SANDBOX_TEST_PROCESS_ENV_VALUE"
+    monkeypatch.setenv(name, "current-worker-value")
+    trusted_manifest = Manifest(
+        environment=Environment(value={name: ProcessEnvValue()})
+    ).with_process_environment_access(name)
+    agent = SandboxAgent(
+        name="worker",
+        model=ScriptedModel(),
+        instructions="Worker.",
+        default_manifest=trusted_manifest,
+    )
+    session_state = TestSessionState(
+        manifest=trusted_manifest,
+        snapshot=NoopSnapshot(id="resume"),
+    )
+    processed = SandboxRuntimeSessionManager._process_resumed_state_manifest(
+        agent=agent,
+        capabilities=[],
+        session_state=session_state,
+        trusted_manifest=trusted_manifest,
+        provider_backend_id="docker",
+    )
+
+    assert processed.manifest._has_process_environment_access() is True  # noqa: SLF001
+    assert await processed.manifest.resolve_environment() == {name: "current-worker-value"}
+
+
+@pytest.mark.asyncio
+async def test_resume_does_not_rebind_removed_process_environment_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "SANDBOX_TEST_PROCESS_ENV_VALUE"
+    monkeypatch.setenv(name, "must-not-be-rebound")
+    originally_trusted = Manifest(
+        environment=Environment(value={"TOKEN": ProcessEnvValue(name=name)})
+    ).with_process_environment_access(("TOKEN", name))
+    current_trusted = originally_trusted.model_copy(
+        update={"environment": Environment(value={})},
+        deep=True,
+    )
+    persisted_manifest = Manifest.model_validate(originally_trusted.model_dump(mode="json"))
+    session_state = TestSessionState(
+        manifest=persisted_manifest,
+        snapshot=NoopSnapshot(id="resume"),
+    )
+    agent = SandboxAgent(
+        name="worker",
+        model=ScriptedModel(),
+        instructions="Worker.",
+        default_manifest=current_trusted,
+    )
+
+    processed = SandboxRuntimeSessionManager._process_resumed_state_manifest(
+        agent=agent,
+        capabilities=[],
+        session_state=session_state,
+        trusted_manifest=current_trusted,
+        provider_backend_id="test",
+    )
+
+    assert processed.manifest._process_environment_access == frozenset()
+    with pytest.raises(ValueError, match=f"binding {name!r} -> 'TOKEN' is not granted"):
+        await processed.manifest.resolve_environment()
 
 
 @pytest.mark.asyncio
